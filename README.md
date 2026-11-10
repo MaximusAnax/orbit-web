@@ -1,247 +1,171 @@
-# Orbit
+# Orbit (v0, web)
 
-Orbit is a capture-first relational memory app for turning messy interpersonal notes into structured, searchable relationship memory.
+Orbit is a capture-first relationship memory app. You write, or upload, the rough note
+you would otherwise keep in your head about someone you met. Orbit extracts a structured
+profile from it, saves it to a private database, makes it searchable by meaning, and
+reminds you when to follow up.
 
-The current product proves the first stage of the concept:
-- a user can land on the homepage
-- paste an unstructured note before authenticating
-- see a structured memory preview
-- sign in with Google
-- save the note into a private memory graph
-- revisit that person later through timelines, semantic search, and follow-up lanes
+**Live demo:** https://orbit-six-blond.vercel.app (you can try capture without an
+account; saving requires Google sign-in)
 
-## Product overview
+## Where this fits
 
-Orbit is designed around one core promise: reduce the cognitive overhead of maintaining a network.
+Orbit has gone through three versions. This repository is the first.
 
-Instead of asking the user to fill out a CRM-style contact form, Orbit begins with a natural-language capture flow. The user writes the rough note they would have otherwise kept in their head, notes app, or chat draft. The system extracts:
-- who the person is
-- where or how they were met
-- the user’s read on the interaction
-- relevant tags and context
-- an estimated follow-up interval
+| Version | What it is | Where |
+|---------|------------|-------|
+| **v0** | This web app: Next.js, Supabase (Postgres + pgvector) and OpenAI | [Live demo](https://orbit-six-blond.vercel.app) |
+| **v1** | A local-first iOS app | [MaximusAnax/orbit](https://github.com/MaximusAnax/orbit) |
+| **v2** | An agent-native memory kept as plain text | Private |
 
-The app then saves that memory into a private, user-scoped data model backed by Supabase and makes it retrievable by meaning, not just exact keywords.
+## How it works
 
-## What exists today
+```mermaid
+flowchart LR
+    N["Note, audio file<br/>or business card"] --> X["/api/extract<br/>OpenAI structured extraction<br/>(streams a live preview)"]
+    X --> P["Preview<br/>before sign-in"]
+    P --> A["Google sign-in<br/>(Supabase Auth)"]
+    A --> C["/api/memories/commit<br/>match or create profile,<br/>embed, idempotent by captureId"]
+    C --> DB[("Supabase Postgres<br/>pgvector, row-level security")]
+    DB --> S["/api/search<br/>vector similarity +<br/>structured boosts"]
+    DB --> F["Follow-ups<br/>daily digest email via Resend"]
+```
 
-### Capture-first landing flow
-- The homepage is the primary product surface, not a marketing-only landing page.
-- Users can type a freeform relationship note immediately, before auth.
-- Draft text and extracted preview state are stored in `localStorage`.
-- The interface animates a staged “memory reveal” so the structured result feels responsive and legible.
+1. **Capture before sign-in.** The homepage is the product. You can type a note, upload
+   an audio file (transcribed with `whisper-1`) or upload a business card photo (read
+   with `gpt-4o-mini`). `/api/extract` turns the text into a structured memory: who the
+   person is, how you met, your read on the interaction, tags and a suggested follow-up
+   interval. It can stream partial results so the preview fills in progressively.
+2. **Save after sign-in.** Pending captures are stored server-side in `pending_captures`
+   and in `localStorage`, so a note survives the Google OAuth redirect. Commits are
+   idempotent by `captureId`.
+3. **Match or create.** A new note is linked to an existing profile on a confident name
+   and organization match. On an ambiguous match the user chooses whether to link it or
+   create a new profile.
+4. **Recall.** Search embeds the query with `text-embedding-3-small`, runs a pgvector
+   RPC, adds boosts for matching tags, organization, role and text, and explains why
+   each result matched. Results are cached for five minutes, in Upstash Redis if it is
+   configured and in process memory otherwise.
+5. **Follow up.** From the dashboard or a profile page you can mark someone contacted,
+   snooze them, pause follow-ups or set a cadence. A `CRON_SECRET`-protected endpoint
+   sends one grouped daily digest email per user through Resend. It respects
+   notification preferences and signed unsubscribe links.
+6. **Act.** Profile pages can be edited by hand, enriched with conservative metadata
+   (provenance is recorded; no external pages are fetched) and used to draft an
+   outreach message.
 
-### AI extraction
-- `POST /api/extract` accepts raw text and returns validated structured memory data.
-- The extraction contract includes contact info, interaction summary/context, sentiment, tags, follow-up timing, and match hints.
-- If `OPENAI_API_KEY` is configured, the app uses OpenAI for extraction and embeddings.
-- If no OpenAI key is present, the app falls back to deterministic local extraction and pseudo-embeddings so the app remains runnable in development.
+Without `OPENAI_API_KEY` the app still runs. It uses heuristic extraction,
+pseudo-embeddings, placeholder transcripts and OCR text, and template outreach drafts.
 
-### Auth and post-auth handshake
-- Google sign-in is implemented through Supabase Auth.
-- The “save” path supports inverted onboarding: capture first, auth second.
-- After auth callback, the app restores the pending capture from browser storage and attempts to commit it without requiring the user to re-enter the note.
+## Stack
 
-### Memory persistence
-- Profile and interaction data are stored in Supabase Postgres.
-- The initial schema includes:
-  - `profiles`
-  - `interactions`
-  - `events`
-- Row-level security is enabled so users can only access their own records.
-- The role field on profiles is stored as `job_role`.
+- **Frontend:** Next.js 15 (App Router), React 19, Tailwind CSS 4, Motion
+- **Backend:** Next.js route handlers, Supabase Auth (Google OAuth), Supabase Postgres
+  with `pgvector` and row-level security on user data
+- **AI:** OpenAI `gpt-4o-mini` (extraction, card OCR, outreach drafts), `whisper-1`
+  (audio), `text-embedding-3-small` (1536-dimension embeddings), with timeouts and
+  retries
+- **Email:** Resend REST API
+- **Hosting:** Vercel
 
-### Matching and dedupe behavior
-- Orbit attempts to determine whether a new capture belongs to an existing profile.
-- Exact or high-confidence matches auto-link.
-- Ambiguous matches return a confirmation state so the user can choose:
-  - link to an existing person
-  - create a new profile
+## Routes
 
-### Authenticated product surfaces
-- `/app` provides:
-  - semantic search
-  - recent captures
-  - overdue follow-ups
-  - upcoming follow-ups
-- `/profiles/[id]` provides:
-  - profile summary
-  - job role and company
-  - follow-up timing
-  - reverse-chronological interaction timeline
+| Route | Purpose |
+|-------|---------|
+| `/` | Capture and preview (works signed out) |
+| `/app` | Dashboard: search, recent captures, overdue and upcoming follow-ups |
+| `/profiles/[id]` | Profile, interaction timeline, editing, follow-up and outreach controls |
+| `/settings/notifications` | Email digest preferences |
+| `/auth/login`, `/auth/callback`, `/auth/error` | Google OAuth through Supabase |
 
-### Search
-- `POST /api/search` embeds the query and calls a Supabase RPC over vector data.
-- Search is semantic rather than exact-match only.
-- Results are grouped by person and include the most relevant interactions/snippets.
+| API | Method | Purpose |
+|-----|--------|---------|
+| `/api/extract` | POST | Structured extraction (JSON or streamed) |
+| `/api/capture/audio` | POST | Audio upload, transcribed |
+| `/api/capture/card` | POST | Business card image, read with a vision model |
+| `/api/memories/commit` | POST | Save a capture, match or create a profile |
+| `/api/search` | POST | Semantic search with ranking explanations |
+| `/api/profiles/[id]` | PATCH | Edit a profile |
+| `/api/profiles/[id]/follow-up` | POST | Mark contacted, snooze, pause, set cadence |
+| `/api/profiles/[id]/enrich` | POST | Conservative enrichment with provenance |
+| `/api/profiles/[id]/outreach-draft` | POST | Draft a follow-up message |
+| `/api/reminders/daily-digest` | POST | Daily digest job (requires `CRON_SECRET`) |
+| `/api/notification-preferences` | GET, PATCH | Read and update email preferences |
+| `/api/notifications/unsubscribe` | GET | Signed one-click unsubscribe |
+| `/api/recall/features` | GET | Feature flags for unbuilt recall modes |
+| `/api/events` | POST | Product telemetry |
 
-### Event tracking and product telemetry
-- The app records lightweight product events in the `events` table.
-- Current tracked events include:
-  - `capture_started`
-  - `extract_succeeded`
-  - `extract_failed`
-  - `oauth_started`
-  - `memory_saved`
-  - `search_run`
-  - `search_result_opened`
+## Data model
 
-### Testing and validation
-- Unit tests cover core validation and memory logic.
-- A Playwright smoke test covers the landing/capture surface.
-- The app currently passes:
-  - `npm run test`
-  - `npm run lint`
-  - `npm run build`
+Defined in forward-only migrations under `supabase/migrations/`:
 
-## Architecture
-
-### Frontend
-- Next.js App Router
-- React
-- Tailwind CSS
-- Motion for reveal/transition behavior
-
-### Backend and data
-- Next.js route handlers for app APIs
-- Supabase Auth for Google OAuth
-- Supabase Postgres for relational storage
-- `pgvector` for semantic search support
-
-### AI layer
-- OpenAI extraction for structured memory parsing
-- OpenAI embeddings for semantic search vectors
-- Local fallback behavior for development when OpenAI keys are absent
-
-## Key routes and APIs
-
-### App routes
-- `/`
-- `/app`
-- `/profiles/[id]`
-- `/auth/login`
-- `/auth/callback`
-- `/auth/error`
-
-### API routes
-- `POST /api/extract`
-- `POST /api/memories/commit`
-- `POST /api/search`
-- `POST /api/events`
-
-## Data model summary
-
-### `profiles`
-Stores the canonical person record for a given user.
-
-Important fields:
-- `full_name`
-- `normalized_name`
-- `current_org`
-- `job_role`
-- `metadata`
-- `last_interaction_at`
-- `next_follow_up_at`
-- `follow_up_interval_days`
-
-### `interactions`
-Stores each captured note tied to a profile.
-
-Important fields:
-- `raw_content`
-- `structured_summary`
-- `search_text`
-- `tags`
-- `sentiment`
-- `suggested_follow_up_days`
-- `embedding`
-- `interaction_date`
-
-### `events`
-Stores lightweight telemetry and funnel data.
-
-## Environment and required setup
-
-Copy `.env.example` to `.env.local`.
-
-Required values:
-- `OPENAI_API_KEY`
-- `NEXT_PUBLIC_SUPABASE_URL`
-- `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY`
-- `NEXT_PUBLIC_APP_URL`
-
-Optional values:
-- `SUPABASE_SERVICE_ROLE_KEY`
-- `SUPABASE_ACCESS_TOKEN`
-- `SUPABASE_DB_PASSWORD`
-
-Platform-side requirements:
-- a Supabase project
-- Google OAuth client credentials configured inside Supabase Auth
-- redirect URLs configured in both Google and Supabase
-- Postgres with `vector` enabled
-
-Recommended local runtime:
-- Node `20.17+`
+- `profiles`: one canonical person per user, with organization, role, follow-up interval
+  and next follow-up date
+- `interactions`: each captured note, with its structured summary, tags, sentiment and a
+  `vector(1536)` embedding
+- `pending_captures`: captures made before sign-in, claimed after OAuth
+- `reminders`: follow-up reminders and their email delivery state (sent, failed, skipped)
+- `enrichment_jobs`: provenance for profile enrichment
+- `notification_preferences`: digest settings and unsubscribe state
+- `events`: product telemetry
 
 ## Local development
 
-Install dependencies:
+Requires Node 20.17+ and a Supabase project, either hosted or local through the Supabase
+CLI. Google OAuth must be configured in Supabase Auth.
 
 ```bash
 npm install
-```
-
-Start local Supabase if using the local DB workflow:
-
-```bash
-npx supabase start
-```
-
-Apply migrations:
-
-```bash
-npx supabase db push
-```
-
-Run the app:
-
-```bash
+cp .env.example .env.local     # then fill in the values below
+npx supabase start             # optional: local Supabase
+npx supabase db push           # apply migrations
 npm run dev
 ```
 
+| Variable | Needed for |
+|----------|-----------|
+| `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | Required |
+| `NEXT_PUBLIC_APP_URL` | Required (OAuth redirects, email links) |
+| `OPENAI_API_KEY` | Real extraction, transcription, OCR and embeddings (local fallbacks otherwise) |
+| `SUPABASE_SERVICE_ROLE_KEY`, `CRON_SECRET` | Daily digest job |
+| `RESEND_API_KEY`, `REMINDER_FROM_EMAIL` | Sending digest emails |
+| `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN` | Optional shared search cache |
+| `FEATURE_GRAPH_RECALL`, `FEATURE_VOICE_SEARCH`, `FEATURE_EXTERNAL_SYNC` | Optional flags (default off) |
+
 ## Testing
 
-Unit tests:
-
 ```bash
-npm run test
+npm test             # Vitest: 32 unit tests
+npm run lint         # ESLint
+npm run build        # production build
+npm run test:e2e     # Playwright: landing smoke test; the authenticated staging
+                     # smoke test runs only when STAGING_AUTH_STATE is set
 ```
 
-E2E smoke test:
+`npm run staging:check` and `npm run production:check` validate an environment before
+launch (see `docs/`).
 
-```bash
-npm run test:e2e
-```
+## Documentation
 
-Production build validation:
+- [`prd.md`](prd.md): product requirements after the MVP
+- [`tdd.md`](tdd.md): technical design
+- [`progress.md`](progress.md): what is built, implementation notes and what is left
+- [`orbit_overview.md`](orbit_overview.md): product thesis
+- [`docs/staging-runbook.md`](docs/staging-runbook.md),
+  [`docs/production-launch-orbit-domain.md`](docs/production-launch-orbit-domain.md):
+  deployment
 
-```bash
-npm run build
-```
+## Limitations
 
-## Current limitations
+- Audio capture is file upload only; there is no in-browser recording.
+- Uploaded audio and card images are processed and then discarded, not stored.
+- The daily digest endpoint exists, but no cron schedule is configured in this repo.
+- Graph recall, voice search and external sync exist only as feature flags; they are not
+  implemented.
+- There is no rate limiting on extraction, upload, search or outreach endpoints.
+- Automated tests are unit-level. End-to-end coverage of the signed-in flows against a
+  real Supabase/OpenAI environment is limited to the opt-in staging smoke test.
 
-- Voice capture is not implemented.
-- Apple auth is not implemented.
-- Outbound reminders are not implemented.
-- Contact enrichment is not implemented.
-- Manual profile editing is not implemented.
-- Search uses vector lookup, but ranking and retrieval strategy are still basic.
-- The Playwright suite is still minimal and does not yet cover full authenticated end-to-end flows against a real Supabase/OpenAI environment.
+## License
 
-## Notes for future development
-
-- The normal runtime path uses authenticated Supabase sessions with RLS, not the service-role key.
-- The OpenAI fallback path is useful for local development, but production quality depends on real model-backed extraction and embeddings.
-- If the schema has already been applied in another environment, schema changes should be added as forward migrations rather than by editing the original init migration.
+[MIT](LICENSE)
